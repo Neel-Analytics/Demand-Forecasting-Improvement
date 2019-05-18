@@ -1,0 +1,154 @@
+* Set zero values to missing;
+
+data ts_data;
+   set abc.eval_fbt_jun13;
+   if value eq 0 then value = .;
+run;
+
+* Create macro var with last date in the data;
+proc sql noprint;
+   select max(month) into: maxdate from ts_data;
+   select put(intnx('month',max(month),1),date9.) into: sasdate from ts_data;
+quit;
+
+* Create summary statistics for each series;
+proc timeseries data=ts_data out=_null_ outsum=outstats;
+by depot sku_class sku;
+id month interval=month;
+var value;
+run;
+
+* How to segment? ;
+* 1. No data: All values are missing -> remove series from the analysis;
+* 2. Old products: No activity last 12 months -> remove series from the analysis;
+* 3. New products: First obs fewer than 6 months ago -> put into separate data set;
+* 4. Intermittent items: Products where 25% of obs are missing -> put into separate data set;
+* 5. Count data: Products where value is below 10 -> put into separate data set;
+* 6. Rest: Remaining products -> put into separate data set - no time to work with seasonality;
+
+* Remove 1 and 2 above;
+data valid_data;
+   set outstats;
+   where _status_ eq 0 and intck('month',end,&maxdate.)<12;
+run;
+
+%let dsid=%sysfunc(open(valid_data));
+%let num=%sysfunc(attrn(&dsid,nlobs));
+%let rc=%sysfunc(close(&dsid));
+%put There are &num observations in dataset one.;
+
+* Create 4 segments;
+proc sql noprint;
+   create table new_products as select a.* from ts_data a, valid_data b
+   where a.depot = b.depot and a.sku_class=b.sku_class and a.sku=b.sku
+   and intck('month',start,&maxdate.)<=6
+   order by depot, sku_class, sku, month;
+
+   create table intermittent as select a.* from ts_data a, valid_data b
+   where a.depot = b.depot and a.sku_class=b.sku_class and a.sku=b.sku
+   and intck('month',start,&maxdate.)>6 and b.nmiss/b.nobs > 0.25
+   order by depot, sku_class, sku, month;
+
+   create table count_data as select a.*,b.max from ts_data a, valid_data b
+   where a.depot = b.depot and a.sku_class=b.sku_class and a.sku=b.sku
+   and intck('month',start,&maxdate.)>6 and b.max<=10 and b.nmiss/b.nobs <= 0.25
+   order by depot, sku_class, sku, month;
+
+   create table okts_data as select a.* from ts_data a, valid_data b
+   where a.depot = b.depot and a.sku_class=b.sku_class and a.sku=b.sku
+   and intck('month',start,&maxdate.)>6 and b.max>10 and b.nmiss/b.nobs <= 0.25
+   order by depot, sku_class, sku, month;
+
+quit;
+
+* Verify that no skus have been left out;
+proc sql;
+	select count(*) from (select distinct depot, sku_class, sku from new_products);
+	select count(*) from (select distinct depot, sku_class, sku from intermittent);
+	select count(*) from (select distinct depot, sku_class, sku from count_data);
+	select count(*) from (select distinct depot, sku_class, sku from okts_data);
+quit;
+
+* Forecast approaches;
+* New products: Simple mean;
+* Intermittent: Simple mean for starters;
+* Count: ESM models with a cap at the max value;
+* OKTSDATA: Full HPFDIAGNOSE/HPFENGINE;
+
+* Create some simple model specs;
+proc hpfarimaspec modelrep=work.ap name=simple_mean;
+forecast symbol=value;
+estimate;
+run;
+
+proc hpfarimaspec modelrep=work.ap name=movavg3;
+forecast symbol=value noint p=3 ar=(0.333 0.333 0.333);
+estimate noest;
+run;
+
+proc hpfarimaspec modelrep=work.ap name=movag4;
+forecast symbol=value noint p=4 ar=(0.25 0.25 0.25 0.25);
+estimate noest;
+run;
+
+* New products - could be achieved just using minobs;
+proc hpfselect modelrep=work.ap name=newprods;
+diagnose seasontest=none intermittent=1000;
+select criterion=mape;
+spec simple_mean;
+run;
+
+proc hpfengine data=new_products modelrep=work.ap globalselection=newprods out=_null_ outfor=fc_newprods lead=2
+				errorcontrol=(severity=(high) stage=all) task=select(minobs=3);
+by depot sku_class sku;
+id month interval=month horizonstart="&sasdate."d trimmiss=left;
+forecast value / noreplace;
+run;
+
+* Intermittent items;
+proc hpfselect modelrep=work.ap name=intermit;
+diagnose seasontest=none intermittent=1000;
+select criterion=mape;
+spec simple_mean movavg3 movavg4;
+run;
+
+proc hpfengine data=intermittent modelrep=work.ap globalselection=intermit out=_null_ outfor=fc_intermit lead=2
+				errorcontrol=(severity=(high) stage=all) task=select(minobs=3);
+by depot sku_class sku;
+id month interval=month horizonstart="&sasdate."d trimmiss=left;
+forecast value / noreplace;
+run;
+
+* Count data;
+* Concatenate list above with list with smoothing models from SASHELP.HPFDFLT;
+proc hpfselect modelrep=work.ap name=count;
+diagnose seasontest=none intermittent=1000;
+select criterion=mape;
+spec simple_mean movavg3 movavg4 SMSIMP SMDAMP SMLIN SMADWN SMWINT SMSEAS;
+run;
+
+catname work.concatlist (work.ap sashelp.hpfdflt);
+
+proc hpfengine data=work.count_data modelrep=work.concatlist globalselection=count out=_null_ outfor=fc_count lead=2
+				errorcontrol=(severity=(high) stage=all) task=select(minobs=3);
+by depot sku_class sku;
+id month interval=month horizonstart="&sasdate."d trimmiss=left;
+adjust value=(max) / operation=(none,min);
+forecast value / noreplace;
+run;
+
+* Remaining items - full treatment;
+proc hpfdiagnose data=okts_data modelrep=work.ap outest=work.ap_est inselectname=intermit errorcontrol=(severity=(high) stage=all);
+by depot sku_class sku;
+id month interval=month trimmiss=left;
+forecast value;
+arimax outlier=(detect=yes maxnum=10);
+esm;
+run;
+
+proc hpfengine data=okts_data modelrep=work.neel inest=work.neel_est out=_null_ outfor=fc_rest lead=2
+errorcontrol=(severity=(high) stage=all) task=select(minobs=3);
+by depot sku_class sku;
+id month interval=month horizonstart="&sasdate."d trimmiss=left;
+forecast value / noreplace;
+run;
